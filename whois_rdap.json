@@ -6,15 +6,15 @@
     "publisher": "Splunk",
     "type": "information",
     "main_module": "whois_rdap_connector.py",
-    "app_version": "2.1.8",
-    "utctime_updated": "2025-09-22T20:10:49.928880Z",
+    "app_version": "2.2.0",
+    "utctime_updated": "2026-06-26T00:00:00.000000Z",
     "product_vendor": "Generic",
     "product_name": "Whois RDAP",
     "product_version_regex": ".*",
     "min_phantom_version": "6.2.2",
     "fips_compliant": true,
     "latest_tested_versions": [
-        "ipwhois-1.3.0"
+        "dnspython-2.8.0"
     ],
     "python_version": "3.9, 3.13",
     "license": "Copyright (c) 2016-2025 Splunk Inc.",
@@ -644,10 +644,6 @@
             {
                 "module": "dnspython",
                 "input_file": "wheels/py3/dnspython-2.7.0-py3-none-any.whl"
-            },
-            {
-                "module": "ipwhois",
-                "input_file": "wheels/shared/ipwhois-1.3.0-py2.py3-none-any.whl"
             }
         ]
     },
@@ -660,10 +656,6 @@
             {
                 "module": "dnspython",
                 "input_file": "wheels/py3/dnspython-2.8.0-py3-none-any.whl"
-            },
-            {
-                "module": "ipwhois",
-                "input_file": "wheels/shared/ipwhois-1.3.0-py2.py3-none-any.whl"
             }
         ]
     }

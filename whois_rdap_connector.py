@@ -16,22 +16,20 @@
 #
 import ipaddress
 import json
+import os
+import sys
+import traceback
+
+import ssl
+import urllib.request
+
+import dns.resolver
 
 import phantom.app as phantom
 from phantom.action_result import ActionResult
 from phantom.base_connector import BaseConnector
 
 from whois_rdap_consts import *
-
-
-try:
-    from urllib2 import ProxyHandler, build_opener
-except ImportError:
-    from urllib.request import ProxyHandler, build_opener
-
-from os import environ
-
-from ipwhois import IPDefinedError, IPWhois
 
 
 class WhoisRDAPConnector(BaseConnector):
@@ -134,32 +132,156 @@ class WhoisRDAPConnector(BaseConnector):
         return self.set_status_save_progress(phantom.APP_ERROR, WHOIS_ERROR_CONNECTIVITY_TEST)
 
     def _lookup_rdap(self, action_result, ip):
-        proxy = {}
-        if environ.get("HTTP_PROXY"):
-            proxy["http"] = environ["HTTP_PROXY"]
-        if environ.get("HTTPS_PROXY"):
-            proxy["https"] = environ["HTTPS_PROXY"]
+        # Check for private/reserved IPs before making network calls
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local \
+                    or ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
+                msg = f"IPv{ip_obj.version} address {ip} is already defined as a special-use address."
+                action_result.set_status(phantom.APP_SUCCESS, msg)
+                return phantom.APP_ERROR, None
+        except ValueError:
+            pass
 
         try:
-            if proxy:
-                self.debug_print("Found proxy env. Using proxy for connection.")
-                handler = ProxyHandler(proxy)
-                opener = build_opener(handler)
-                obj_whois = IPWhois(ip, proxy_opener=opener)
-            else:
-                obj_whois = IPWhois(ip)
-            whois_response = obj_whois.lookup_rdap(inc_nir=False)
+            whois_response = self._rdap_request(ip)
             return phantom.APP_SUCCESS, whois_response
-        except IPDefinedError as e_defined:
-            self.error_print("Got IPDefinedError: ", e_defined)
-            action_result.set_status(phantom.APP_SUCCESS, str(e_defined))
-            return phantom.APP_ERROR, None
         except Exception as e:
-            self.error_print("Got exception object: ", e)
+            tb = traceback.format_exc()
+            self.error_print(f"Got exception ({type(e).__name__}): {e}\n{tb}")
             return action_result.set_status(phantom.APP_ERROR, WHOIS_ERROR_QUERY.format(e)), None
 
+    def _rdap_request(self, ip):
+        """Make RDAP lookup using urllib.request with a custom TLS context.
+
+        Excludes post-quantum key exchange groups (X25519MLKEM768) from the
+        ClientHello that trigger TCP RST from SSL-inspection appliances
+        on OpenSSL 3.5+.  TLS 1.3 is still supported with classical groups.
+        """
+        url = f"https://rdap.arin.net/registry/ip/{ip}"
+
+        # Resolve CA bundle (REQUESTS_CA_BUNDLE > CURL_CA_BUNDLE > certifi)
+        ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+        if not ca_bundle or not os.path.isfile(ca_bundle):
+            try:
+                import certifi
+                ca_bundle = certifi.where()
+            except ImportError:
+                ca_bundle = None
+
+        # Build TLS context with only classical key exchange groups
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.set_ecdh_curve("X25519:P-256:P-384:P-521")
+        if ca_bundle and os.path.isfile(ca_bundle):
+            ctx.load_verify_locations(ca_bundle)
+        else:
+            ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
+
+        handler = urllib.request.HTTPSHandler(context=ctx)
+        opener = urllib.request.build_opener(handler)
+        req = urllib.request.Request(url, headers={"Accept": "application/rdap+json"})
+        resp = opener.open(req, timeout=30)
+        final_url = resp.url
+        data = json.loads(resp.read().decode("utf-8"))
+
+        # Determine registry from the final URL after any redirects
+        final_url = resp.url
+        registry = "arin"
+        for reg, host in [("ripencc", "ripe.net"), ("apnic", "apnic.net"),
+                          ("lacnic", "lacnic.net"), ("afrinic", "afrinic.net")]:
+            if host in final_url:
+                registry = reg
+                break
+
+        asn, asn_cidr, asn_country, asn_desc = self._cymru_asn_lookup(ip)
+
+        objects = {}
+        for entity in data.get("entities", []):
+            handle = entity.get("handle") or ",".join(entity.get("roles", ["unknown"]))
+            obj = {
+                "handle": handle,
+                "roles": entity.get("roles", []),
+                "status": entity.get("status", []),
+                "links": entity.get("links", []),
+                "events": entity.get("events", []),
+                "entities": entity.get("entities", []),
+            }
+            if "vcardArray" in entity:
+                obj["contact"] = self._parse_vcard(entity["vcardArray"])
+            objects[handle] = obj
+
+        return {
+            "query": ip,
+            "asn_registry": registry,
+            "asn": asn,
+            "asn_cidr": asn_cidr,
+            "asn_country_code": asn_country or data.get("country"),
+            "asn_date": None,
+            "asn_description": asn_desc,
+            "network": {
+                "handle": data.get("handle"),
+                "start_address": data.get("startAddress"),
+                "end_address": data.get("endAddress"),
+                "name": data.get("name"),
+                "type": data.get("type"),
+                "parent_handle": data.get("parentHandle"),
+                "ip_version": data.get("ipVersion"),
+                "country": data.get("country"),
+                "status": data.get("status"),
+                "events": data.get("events"),
+                "links": data.get("links"),
+                "remarks": data.get("remarks"),
+            },
+            "objects": objects,
+        }
+
+    def _cymru_asn_lookup(self, ip):
+        """Resolve ASN info via Cymru DNS service."""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.version == 4:
+                rev = ".".join(reversed(ip.split(".")))
+                qname = f"{rev}.origin.asn.cymru.com"
+            else:
+                nibbles = ip_obj.exploded.replace(":", "")
+                rev = ".".join(reversed(nibbles))
+                qname = f"{rev}.origin6.asn.cymru.com"
+            answers = dns.resolver.resolve(qname, "TXT")
+            for rdata in answers:
+                txt = str(rdata).strip('"')
+                parts = [p.strip() for p in txt.split("|")]
+                if len(parts) >= 4:
+                    return (
+                        parts[0] or None,
+                        parts[1] or None,
+                        parts[3] or None,
+                        parts[4] if len(parts) > 4 else None,
+                    )
+        except Exception:
+            pass
+        return None, None, None, None
+
+    def _parse_vcard(self, vcard_array):
+        contact = {}
+        try:
+            for field in vcard_array[1]:
+                name = field[0] if field else ""
+                val = field[3] if len(field) > 3 else ""
+                if name == "fn":
+                    contact["name"] = val
+                elif name == "email":
+                    contact["email"] = val
+                elif name in ("tel",):
+                    contact["phone"] = val
+                elif name == "adr":
+                    contact["address"] = val
+                elif name == "org":
+                    contact["org"] = val
+        except Exception:
+            pass
+        return contact
+
     def finalize(self):
-        # Save the state, this data is saved across actions and app upgrades
         self.save_state(self._state)
         return phantom.APP_SUCCESS
 
